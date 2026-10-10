@@ -106,6 +106,15 @@ func handshake(host, transport string) (net.Conn, error) {
 	return conn, nil
 }
 
+// Log reports data the camera sends on channels go2rtc does not use, and unknown message types.
+var Log func(format string, args ...any)
+
+func logf(format string, args ...any) {
+	if Log != nil {
+		Log(format, args...)
+	}
+}
+
 func (c *Conn) worker() {
 	defer func() {
 		c.channels[0].Close()
@@ -131,6 +140,10 @@ func (c *Conn) worker() {
 		switch buf[1] {
 		case msgDrw:
 			ch := buf[5]
+			if int(ch) >= len(c.channels) || c.channels[ch] == nil {
+				logf("cs2: data on unused channel %d: %x", ch, buf[:n])
+				continue
+			}
 			channel := c.channels[ch]
 
 			if c.isTCP {
@@ -265,7 +278,7 @@ func (c *Conn) WritePacket(hdr, payload []byte) error {
 	c.seqCh3++
 	binary.BigEndian.PutUint32(req[8:], n)
 	copy(req[offset:], hdr)
-	copy(req[offset+hdrSize:], hdr)
+	copy(req[offset+hdrSize:], payload)
 
 	_, err := c.Conn.Write(req)
 	return err

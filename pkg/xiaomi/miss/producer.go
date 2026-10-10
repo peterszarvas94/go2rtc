@@ -115,10 +115,16 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 			Codecs:    []*core.Codec{acodec},
 		})
 
+		// The two-way audio keeps its previous format (8 kHz for A-law)
+		backchannel := acodec.Clone()
+		if backchannel.Name == core.CodecPCMA {
+			backchannel.ClockRate = 8000
+		}
+
 		medias = append(medias, &core.Media{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionSendonly,
-			Codecs:    []*core.Codec{acodec.Clone()},
+			Codecs:    []*core.Codec{backchannel},
 		})
 	}
 
@@ -191,6 +197,16 @@ func (p *Producer) Start() error {
 			}
 		}
 	}
+}
+
+// Subscribe follows the messages of the camera of a playing stream.
+func (p *Producer) Subscribe() (<-chan []byte, func()) {
+	return p.client.Subscribe()
+}
+
+// SendCommand sends a raw MISS command to the camera while the stream is playing (e.g. PTZ).
+func (p *Producer) SendCommand(cmd uint32, payload []byte) ([]byte, error) {
+	return p.client.SendCommand(cmd, payload, 2*time.Second)
 }
 
 func (p *Producer) Stop() error {
