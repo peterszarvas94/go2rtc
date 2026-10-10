@@ -47,6 +47,22 @@ func NewStream(source any) *Stream {
 	}
 }
 
+// Conns returns the connected producers, for modules that control the device (e.g. PTZ).
+func (s *Stream) Conns() []core.Producer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var conns []core.Producer
+	for _, prod := range s.producers {
+		prod.mu.Lock()
+		if prod.conn != nil {
+			conns = append(conns, prod.conn)
+		}
+		prod.mu.Unlock()
+	}
+	return conns
+}
+
 func (s *Stream) Sources() []string {
 	sources := make([]string, 0, len(s.producers))
 	for _, prod := range s.producers {

@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math/bits"
 	"net"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/tutk"
@@ -72,13 +74,105 @@ func NewClient(rawURL string) (*Client, error) {
 		return nil, err
 	}
 
-	return &Client{Conn: conn, key: key, model: model}, nil
+	client := &Client{Conn: conn, key: key, model: model, replies: make(chan []byte, 10)}
+	go client.readReplies()
+	return client, nil
 }
+
+// Log receives every message the camera sends on the command channel (set by internal/xiaomi).
+// Most are replies to our own commands; unsolicited ones may carry events like motion alarms.
+var Log func(cmd uint32, data []byte)
 
 type Client struct {
 	Conn
 	key   []byte
 	model string
+
+	replies     chan []byte
+	sendMu      sync.Mutex
+	listeners   map[chan []byte]struct{}
+	listenersMu sync.Mutex
+}
+
+// SendCommand sends a MISS command (like cmdMotorReq) and waits a moment for the camera reply.
+// Replies must always be read: the command channel has a small buffer and the connection
+// is closed when it is full.
+func (c *Client) SendCommand(cmd uint32, payload []byte, wait time.Duration) ([]byte, error) {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+
+	// Drop replies to previous commands that arrived after their timeout
+	for len(c.replies) > 0 {
+		<-c.replies
+	}
+
+	data := binary.BigEndian.AppendUint32(nil, cmd)
+	data = append(data, payload...)
+	if err := c.WriteCommand(data); err != nil {
+		return nil, err
+	}
+
+	select {
+	case reply := <-c.replies:
+		return reply, nil
+	case <-time.After(wait):
+		return nil, nil
+	}
+}
+
+// Replies exposes the messages read from the command channel.
+func (c *Client) Replies() <-chan []byte {
+	return c.replies
+}
+
+// Subscribe follows every message the camera sends, for as long as the returned function is not called.
+// The camera sends a motor message on its own when it turns to follow a movement.
+func (c *Client) Subscribe() (<-chan []byte, func()) {
+	messages := make(chan []byte, 10)
+
+	c.listenersMu.Lock()
+	if c.listeners == nil {
+		c.listeners = map[chan []byte]struct{}{}
+	}
+	c.listeners[messages] = struct{}{}
+	c.listenersMu.Unlock()
+
+	return messages, func() {
+		c.listenersMu.Lock()
+		delete(c.listeners, messages)
+		c.listenersMu.Unlock()
+	}
+}
+
+func (c *Client) readReplies() {
+	for {
+		cmd, data, err := c.Conn.ReadCommand()
+		if err != nil {
+			return
+		}
+		if (cmd == cmdEncoded || bits.ReverseBytes32(cmd) == cmdEncoded) && len(data) > 8 {
+			if decoded, err := crypto.Decode(data, c.key); err == nil {
+				data = decoded
+			}
+		}
+		if Log != nil {
+			Log(cmd, data)
+		}
+
+		c.listenersMu.Lock()
+		for messages := range c.listeners {
+			select {
+			case messages <- data:
+			default:
+			}
+		}
+		c.listenersMu.Unlock()
+
+		select {
+		case c.replies <- data:
+		default:
+		}
+	}
 }
 
 const (
@@ -201,6 +295,11 @@ func (c *Client) StartAudio() error {
 
 func (c *Client) StartSpeaker() error {
 	data := binary.BigEndian.AppendUint32(nil, cmdSpeakerStartReq)
+	return c.WriteCommand(data)
+}
+
+func (c *Client) StopSpeaker() error {
+	data := binary.BigEndian.AppendUint32(nil, cmdSpeakerStop)
 	return c.WriteCommand(data)
 }
 

@@ -56,6 +56,7 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 	_ = client.SetDeadline(time.Now().Add(15 * time.Second))
 
 	var vcodec, acodec *core.Codec
+	var firstPCMA *Packet
 
 	for {
 		pkt, err := client.ReadPacket()
@@ -84,8 +85,14 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 				}
 			}
 		case codecPCMA:
+			// Some cameras (e.g. chuangmi.camera.026c02) send 16 kHz A-law, so the rate is measured
+			// from two consecutive packets instead of assuming 8 kHz
 			if acodec == nil {
-				acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: 8000}
+				if firstPCMA == nil {
+					firstPCMA = pkt
+				} else if pkt.Timestamp > firstPCMA.Timestamp {
+					acodec = &core.Codec{Name: core.CodecPCMA, ClockRate: pcmaClockRate(firstPCMA, pkt)}
+				}
 			}
 		case codecOPUS:
 			if acodec == nil {
@@ -115,14 +122,29 @@ func probe(client *Client, audio bool) ([]*core.Media, error) {
 			Codecs:    []*core.Codec{acodec},
 		})
 
+		// The two-way audio keeps its previous format (8 kHz for A-law)
+		backchannel := acodec.Clone()
+		if backchannel.Name == core.CodecPCMA {
+			backchannel.ClockRate = 8000
+		}
+
 		medias = append(medias, &core.Media{
 			Kind:      core.KindAudio,
 			Direction: core.DirectionSendonly,
-			Codecs:    []*core.Codec{acodec.Clone()},
+			Codecs:    []*core.Codec{backchannel},
 		})
 	}
 
 	return medias, nil
+}
+
+// pcmaClockRate guesses the A-law sample rate (1 byte per sample) from the duration of the first packet
+func pcmaClockRate(first, next *Packet) uint32 {
+	rate := uint64(len(first.Payload)) * 1000 / (next.Timestamp - first.Timestamp)
+	if rate > 12000 {
+		return 16000
+	}
+	return 8000
 }
 
 const timestamp40ms = 48000 * 0.040
@@ -191,6 +213,16 @@ func (p *Producer) Start() error {
 			}
 		}
 	}
+}
+
+// Subscribe follows the messages of the camera of a playing stream.
+func (p *Producer) Subscribe() (<-chan []byte, func()) {
+	return p.client.Subscribe()
+}
+
+// SendCommand sends a raw MISS command to the camera while the stream is playing (e.g. PTZ).
+func (p *Producer) SendCommand(cmd uint32, payload []byte) ([]byte, error) {
+	return p.client.SendCommand(cmd, payload, 2*time.Second)
 }
 
 func (p *Producer) Stop() error {
